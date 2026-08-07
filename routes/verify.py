@@ -20,42 +20,51 @@ def resize_frame(frame, max_dim=640):
 
 def detect_motion(video_path: str) -> tuple[bool, float]:
     """
-    Analyzes video for frame-to-frame motion.
+    Analyzes video for frame-to-frame motion by sub-sampling max 15 evenly-spaced frames.
     Returns (passed_liveness, max_mean_diff).
     """
-    # Open the uploaded file as a video stream.
     cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return True, 0.0
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total_frames <= 1:
+        cap.release()
+        return True, 0.0
+
+    max_samples = 15
+    step = max(1, total_frames // max_samples)
+
     prev_gray = None
     max_diff = 0.0
-    frame_count = 0
+    sampled_count = 0
 
-    # Read video frame by frame until no frame is left.
-    while True:
+    for frame_idx in range(0, total_frames, step):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ret, frame = cap.read()
-        if not ret:
+        if not ret or frame is None:
             break
-        frame_count += 1
-        # Convert to grayscale to simplify motion comparison.
+
+        # Fast downscale to 320px for high-speed motion difference calculation
+        h, w = frame.shape[:2]
+        if max(h, w) > 320:
+            scale = 320.0 / max(h, w)
+            frame = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_NEAREST)
+
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
+
         if prev_gray is not None:
-            # Calculate average pixel difference per pixel (resolution independent)
             diff = cv2.absdiff(prev_gray, gray)
             mean_diff = float(diff.mean())
             if mean_diff > max_diff:
                 max_diff = mean_diff
-                
+
         prev_gray = gray
+        sampled_count += 1
+        if sampled_count >= max_samples:
+            break
 
-    # Always release the video resource.
     cap.release()
-
-    # If no usable video frames were found, allow verification to continue.
-    if frame_count <= 1:
-        # This supports image uploads and avoids false liveness failures.
-        return True, 0.0
-
-    # Pass liveness when enough frame-to-frame movement is detected.
     passed = max_diff >= 0.5
     return passed, max_diff
 
@@ -91,13 +100,24 @@ async def verify_user(user_id: str = Form(...), file: UploadFile = File(...)):
         np_arr = np.frombuffer(content, np.uint8)
         extracted_frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
-        # If image decode fails, treat it as video and read first frame.
+        # If image decode fails, treat it as video and read the Middle Frame (50% midpoint)
         if extracted_frame is None:
             cap = cv2.VideoCapture(tmp_path)
-            ret, frame = cap.read()
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if total_frames > 0:
+                mid_idx = max(0, total_frames // 2)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, mid_idx)
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    extracted_frame = frame
+            
+            # Fallback if midpoint seek fails
+            if extracted_frame is None:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    extracted_frame = frame
             cap.release()
-            if ret and frame is not None:
-                extracted_frame = frame
 
         if extracted_frame is None:
             print("  [ERROR] Failed to decode image or video frame from upload")
@@ -105,7 +125,7 @@ async def verify_user(user_id: str = Form(...), file: UploadFile = File(...)):
 
         # Resize image for fast OpenCV face detection & feature extraction
         extracted_frame = resize_frame(extracted_frame, max_dim=640)
-        print(f"  [1/4] File Read, Temp Save & Frame Resize: {(time.perf_counter() - t0)*1000:.1f} ms")
+        print(f"  [1/4] File Read, Middle Frame Select & Resize: {(time.perf_counter() - t0)*1000:.1f} ms")
 
         # Run a simple liveness check based on motion across frames.
         t0 = time.perf_counter()
