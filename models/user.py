@@ -6,4 +6,3 @@ class User(BaseModel):
     name: str
     age: int
     embedding: List[float]
-    image_path: str

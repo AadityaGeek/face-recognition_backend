@@ -1,28 +1,23 @@
 from fastapi import APIRouter, UploadFile, File, Form
 from deepface import DeepFace
 from database.db import users_collection
+from utils.image_utils import resize_frame
 import numpy as np
 import cv2
 import tempfile, os
+import time
 
 router = APIRouter()
 COSINE_THRESHOLD = 0.40  # Cosine distance threshold for Facenet (distance <= 0.40 corresponds to >= 60% similarity)
-
-def resize_frame(frame, max_dim=640):
-    if frame is None:
-        return frame
-    h, w = frame.shape[:2]
-    if max(h, w) > max_dim:
-        scale = max_dim / float(max(h, w))
-        new_w, new_h = int(w * scale), int(h * scale)
-        return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    return frame
 
 def detect_motion(video_path: str) -> tuple[bool, float]:
     """
     Analyzes video for frame-to-frame motion by sub-sampling max 15 evenly-spaced frames.
     Returns (passed_liveness, max_mean_diff).
     """
+    if not video_path or not os.path.exists(video_path):
+        return True, 0.0
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return True, 0.0
@@ -69,39 +64,30 @@ def detect_motion(video_path: str) -> tuple[bool, float]:
     return passed, max_diff
 
 
-import time
-
 @router.post("/verify")
 async def verify_user(user_id: str = Form(...), file: UploadFile = File(...)):
     t_start = time.perf_counter()
     print(f"\n--- [VERIFY START] user_id: {user_id} ---")
     tmp_path = None
     try:
-        # Keep the original extension so OpenCV can decode the file correctly.
-        filename = file.filename or "upload.mp4"
-        ext = os.path.splitext(filename)[1].lower()
-        if not ext:
-            # Fallback: choose extension from content type when missing.
-            ext = ".mp4" if "video" in (file.content_type or "") else ".jpg"
-
         t0 = time.perf_counter()
-        # Read uploaded bytes once and reuse for decode + temp file write.
         content = await file.read()
 
-        # Save upload to a temp file (used for video frame read and liveness check).
-        tmp_fd, tmp_path = tempfile.mkstemp(suffix=ext)
-        with os.fdopen(tmp_fd, "wb") as f:
-            f.write(content)
-
-        # Extract one face frame from image/video for comparison.
         extracted_frame = None
-
-        # First, try decoding the upload as a normal image.
+        # First, try decoding the upload directly as an in-memory image
         np_arr = np.frombuffer(content, np.uint8)
         extracted_frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
-        # If image decode fails, treat it as video and read the Middle Frame (50% midpoint)
+        # If image decode fails, treat it as a video upload
         if extracted_frame is None:
+            filename = file.filename or "upload.mp4"
+            ext = os.path.splitext(filename)[1].lower() or ".mp4"
+
+            # Create temp video file for OpenCV video stream reading
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix=ext)
+            with os.fdopen(tmp_fd, "wb") as f:
+                f.write(content)
+
             cap = cv2.VideoCapture(tmp_path)
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             if total_frames > 0:
@@ -110,8 +96,7 @@ async def verify_user(user_id: str = Form(...), file: UploadFile = File(...)):
                 ret, frame = cap.read()
                 if ret and frame is not None:
                     extracted_frame = frame
-            
-            # Fallback if midpoint seek fails
+
             if extracted_frame is None:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 ret, frame = cap.read()
@@ -125,11 +110,11 @@ async def verify_user(user_id: str = Form(...), file: UploadFile = File(...)):
 
         # Resize image for fast OpenCV face detection & feature extraction
         extracted_frame = resize_frame(extracted_frame, max_dim=640)
-        print(f"  [1/4] File Read, Middle Frame Select & Resize: {(time.perf_counter() - t0)*1000:.1f} ms")
+        print(f"  [1/4] File Read, Decode & Frame Resize: {(time.perf_counter() - t0)*1000:.1f} ms")
 
-        # Run a simple liveness check based on motion across frames.
+        # Run motion liveness check (runs only if video file exists)
         t0 = time.perf_counter()
-        is_live, motion_score = detect_motion(tmp_path)
+        is_live, motion_score = detect_motion(tmp_path) if tmp_path else (True, 0.0)
         print(f"  [2/4] Liveness Motion Check: {(time.perf_counter() - t0)*1000:.1f} ms (Passed: {is_live}, Score: {motion_score:.3f})")
         if not is_live:
             print(f"  [WARN] Liveness check failed for user_id: {user_id}")

@@ -8,6 +8,7 @@ import cv2
 import time
 from database.db import users_collection
 from models.user import User
+from utils.image_utils import resize_frame, cosine_similarity
 
 router = APIRouter()
 
@@ -19,21 +20,6 @@ DUPLICATE_THRESHOLD = 0.4  # 40%
 async def check_user_id(user_id: str):
     user = users_collection.find_one({"user_id": user_id}, {"_id": 1})
     return {"exists": user is not None, "user_id": user_id}
-
-def cosine_similarity(vec1, vec2):
-    v1 = np.array(vec1)
-    v2 = np.array(vec2)
-    return np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
-
-def resize_frame(frame, max_dim=640):
-    if frame is None:
-        return frame
-    h, w = frame.shape[:2]
-    if max(h, w) > max_dim:
-        scale = max_dim / float(max(h, w))
-        new_w, new_h = int(w * scale), int(h * scale)
-        return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    return frame
 
 @router.post("/register")
 async def register_user(
@@ -70,9 +56,9 @@ async def register_user(
         print(f"  [ERROR] Face embedding failed: {str(e)}")
         return {"success": False, "error": f"Face embedding failed: {str(e)}"}
 
-    # Check for duplicates using cosine similarity
+    # Check for duplicates using cosine similarity with projection (skips image_data transfer)
     t0 = time.perf_counter()
-    for existing in users_collection.find():
+    for existing in users_collection.find({}, {"embedding": 1, "user_id": 1, "name": 1, "age": 1}):
         if "embedding" not in existing:
             continue
         sim = cosine_similarity(embedding, existing["embedding"])
@@ -95,8 +81,7 @@ async def register_user(
         user_id=user_id,
         name=name,
         age=age,
-        embedding=embedding,
-        image_path=""
+        embedding=embedding
     )
 
     users_collection.insert_one({
