@@ -38,3 +38,20 @@ def health():
 app.include_router(register.router)
 app.include_router(verify.router)
 
+@app.on_event("startup")
+async def warmup_deepface_model():
+    try:
+        import numpy as np
+        from deepface import DeepFace
+        print("Warming up DeepFace Facenet model on server startup...")
+        dummy_img = np.zeros((100, 100, 3), dtype=np.uint8)
+        DeepFace.represent(
+            dummy_img,
+            model_name="Facenet",
+            detector_backend="opencv",
+            enforce_detection=False
+        )
+        print("DeepFace Facenet model warmed up successfully!")
+    except Exception as e:
+        print(f"Model warmup notice: {e}")
+

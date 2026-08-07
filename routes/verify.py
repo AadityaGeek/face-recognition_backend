@@ -8,6 +8,16 @@ import tempfile, os
 router = APIRouter()
 COSINE_THRESHOLD = 0.40  # Cosine distance threshold for Facenet (distance <= 0.40 corresponds to >= 60% similarity)
 
+def resize_frame(frame, max_dim=640):
+    if frame is None:
+        return frame
+    h, w = frame.shape[:2]
+    if max(h, w) > max_dim:
+        scale = max_dim / float(max(h, w))
+        new_w, new_h = int(w * scale), int(h * scale)
+        return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    return frame
+
 def detect_motion(video_path: str) -> tuple[bool, float]:
     """
     Analyzes video for frame-to-frame motion.
@@ -50,8 +60,12 @@ def detect_motion(video_path: str) -> tuple[bool, float]:
     return passed, max_diff
 
 
+import time
+
 @router.post("/verify")
 async def verify_user(user_id: str = Form(...), file: UploadFile = File(...)):
+    t_start = time.perf_counter()
+    print(f"\n--- [VERIFY START] user_id: {user_id} ---")
     tmp_path = None
     try:
         # Keep the original extension so OpenCV can decode the file correctly.
@@ -61,6 +75,7 @@ async def verify_user(user_id: str = Form(...), file: UploadFile = File(...)):
             # Fallback: choose extension from content type when missing.
             ext = ".mp4" if "video" in (file.content_type or "") else ".jpg"
 
+        t0 = time.perf_counter()
         # Read uploaded bytes once and reuse for decode + temp file write.
         content = await file.read()
 
@@ -85,11 +100,19 @@ async def verify_user(user_id: str = Form(...), file: UploadFile = File(...)):
                 extracted_frame = frame
 
         if extracted_frame is None:
+            print("  [ERROR] Failed to decode image or video frame from upload")
             return {"verified": False, "is_live": False, "error": "Failed to decode image or video frame from upload"}
 
+        # Resize image for fast OpenCV face detection & feature extraction
+        extracted_frame = resize_frame(extracted_frame, max_dim=640)
+        print(f"  [1/4] File Read, Temp Save & Frame Resize: {(time.perf_counter() - t0)*1000:.1f} ms")
+
         # Run a simple liveness check based on motion across frames.
+        t0 = time.perf_counter()
         is_live, motion_score = detect_motion(tmp_path)
+        print(f"  [2/4] Liveness Motion Check: {(time.perf_counter() - t0)*1000:.1f} ms (Passed: {is_live}, Score: {motion_score:.3f})")
         if not is_live:
+            print(f"  [WARN] Liveness check failed for user_id: {user_id}")
             return {
                 "verified": False,
                 "is_live": False,
@@ -97,34 +120,50 @@ async def verify_user(user_id: str = Form(...), file: UploadFile = File(...)):
                 "motion_score": round(motion_score, 3)
             }
 
-        # Load the stored reference image for this user from the database.
-        user = users_collection.find_one({"user_id": user_id})
-        if not user or "image_data" not in user:
-            return {"verified": False, "is_live": True, "error": "User not found or no reference image stored"}
+        # Load user record from MongoDB with field projection (skips fetching heavy image binary)
+        t0 = time.perf_counter()
+        user = users_collection.find_one(
+            {"user_id": user_id},
+            {"embedding": 1, "name": 1, "age": 1, "user_id": 1}
+        )
+        print(f"  [3/4] MongoDB Vector Lookup: {(time.perf_counter() - t0)*1000:.1f} ms")
+        if not user:
+            print(f"  [ERROR] User not found: {user_id}")
+            return {"verified": False, "is_live": True, "error": "User not found"}
 
-        stored_bytes = user["image_data"]
-        np_arr_stored = np.frombuffer(stored_bytes, np.uint8)
-        # Decode the stored image bytes into an OpenCV image.
-        stored_img = cv2.imdecode(np_arr_stored, cv2.IMREAD_COLOR)
+        if "embedding" not in user:
+            print("  [ERROR] User profile missing face biometric data")
+            return {"verified": False, "is_live": True, "error": "User profile missing face biometric data"}
 
-        if stored_img is None:
-            return {"verified": False, "is_live": True, "error": "Failed to decode stored user reference image"}
-
-        # Compare uploaded face with stored face using DeepFace.
-        result = DeepFace.verify(
+        # Extract embedding from uploaded face frame
+        t0 = time.perf_counter()
+        rep = DeepFace.represent(
             extracted_frame,
-            stored_img,
             model_name="Facenet",
             detector_backend="opencv",
-            distance_metric="cosine",
             enforce_detection=False
         )
+        if not rep or len(rep) == 0:
+            print("  [ERROR] Could not extract face biometric from upload")
+            return {"verified": False, "is_live": True, "error": "Could not extract face biometric from upload"}
 
-        distance = result.get("distance", 1.0)
+        incoming_vec = np.array(rep[0]["embedding"])
+        stored_vec = np.array(user["embedding"])
+
+        # Compute Cosine Distance directly using pre-stored vector
+        norm1 = np.linalg.norm(incoming_vec)
+        norm2 = np.linalg.norm(stored_vec)
+        if norm1 == 0 or norm2 == 0:
+            distance = 1.0
+        else:
+            cos_sim = float(np.dot(incoming_vec, stored_vec) / (norm1 * norm2))
+            distance = max(0.0, 1.0 - cos_sim)
+
         # Convert cosine distance (0.0 = identical, 1.0 = completely different) to similarity percentage.
         similarity = max(0.0, (1.0 - distance)) * 100.0
         # Check against standard Facenet cosine distance threshold.
         verified = distance <= COSINE_THRESHOLD
+        print(f"  [4/4] DeepFace Feature Extraction & Math: {(time.perf_counter() - t0)*1000:.1f} ms (Dist: {distance:.4f}, Match: {verified})")
 
         response = {
             "verified": verified,
@@ -142,9 +181,13 @@ async def verify_user(user_id: str = Form(...), file: UploadFile = File(...)):
         else:
             response["message"] = "Face biometric does not match stored user profile"
 
+        t_total = (time.perf_counter() - t_start) * 1000
+        print(f"--- [VERIFY COMPLETE] Verified: {verified} | Total Time: {t_total:.1f} ms ---\n")
+
         return response
 
     except Exception as e:
+        print(f"  [EXCEPT] Server error: {str(e)}")
         return {"verified": False, "error": f"Server error: {str(e)}"}
 
     finally:

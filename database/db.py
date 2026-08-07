@@ -12,3 +12,9 @@ if not mongo_uri:
 client = MongoClient(mongo_uri) if mongo_uri else None
 db = client["face_recognition_db"] if client else None
 users_collection = db["users"] if db is not None else None
+
+if users_collection is not None:
+    try:
+        users_collection.create_index("user_id", unique=True)
+    except Exception as e:
+        pass
