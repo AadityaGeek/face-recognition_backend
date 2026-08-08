@@ -49,12 +49,12 @@ async def register_user(
             img,
             model_name="Facenet",
             detector_backend="opencv",
-            enforce_detection=False
+            enforce_detection=True
         )[0]["embedding"]
         print(f"  [2/4] DeepFace Feature Extraction: {(time.perf_counter() - t0)*1000:.1f} ms")
     except Exception as e:
         print(f"  [ERROR] Face embedding failed: {str(e)}")
-        return {"success": False, "error": f"Face embedding failed: {str(e)}"}
+        return {"success": False, "error": "No face detected in the image. Please provide a clear image with a visible face."}
 
     # Check for duplicates using cosine similarity with projection (skips image_data transfer)
     t0 = time.perf_counter()

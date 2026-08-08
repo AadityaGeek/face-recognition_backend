@@ -142,12 +142,17 @@ async def verify_user(user_id: str = Form(...), file: UploadFile = File(...)):
 
         # Extract embedding from uploaded face frame
         t0 = time.perf_counter()
-        rep = DeepFace.represent(
-            extracted_frame,
-            model_name="Facenet",
-            detector_backend="opencv",
-            enforce_detection=False
-        )
+        try:
+            rep = DeepFace.represent(
+                extracted_frame,
+                model_name="Facenet",
+                detector_backend="opencv",
+                enforce_detection=True
+            )
+        except Exception as e:
+            print(f"  [ERROR] Face detection/embedding failed: {str(e)}")
+            return {"verified": False, "is_live": True, "error": "No face detected in the image. Please ensure your face is clearly visible."}
+
         if not rep or len(rep) == 0:
             print("  [ERROR] Could not extract face biometric from upload")
             return {"verified": False, "is_live": True, "error": "Could not extract face biometric from upload"}
